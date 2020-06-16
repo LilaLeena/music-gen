@@ -5,10 +5,11 @@ hparams = {
     "max_seq_length": 2048, # The longest piece we can process, everything longer will be discarted
     "lr": 1e-4, # Too high -> diverge, too low -> slow training
     "batch_size": 16, # The bigger the better
-    "epoch_length": 100, # Checkpoint every epoch
-    "epochs": 300,
+    "epoch_length": 10000, # Checkpoint every epoch
+    "epochs": 100,
     "checkpoint_dir": "checkpoints",
     "load_checkpoint": None,
+    "use_multi_gpu": True,
 }
 hparams["iters"] = hparams["epochs"] * hparams["epoch_length"]
 
@@ -21,7 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json
 import transformers
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 
 
 r = requests.get('https://raw.githubusercontent.com/adactio/TheSession-data/master/json/tunes.json')
@@ -59,6 +60,12 @@ model = transformers.GPT2LMHeadModel(transformers.GPT2Config(
 if hparams["load_checkpoint"]:
   model.load_state_dict(torch.load(hparams["load_checkpoint"]))
 
+multigpu = False
+if torch.cuda.device_count() > 1 and hparams["use_multi_gpu"]:
+    print("Using %d GPUs" % torch.cuda.device_count())
+    model = torch.nn.DataParallel(model)
+    multigpu = True
+
 optim = torch.optim.Adam(model.parameters(), lr=hparams["lr"])
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -91,12 +98,24 @@ for i in tqdm(range(0, hparams['iters'])):
     
     optim.zero_grad()
     # The forward function is documented here: https://huggingface.co/transformers/model_doc/gpt2.html#gpt2lmheadmodel
-    loss, predictions, past = model.forward(batch, attention_mask=mask, labels=features[indices])
+    loss, predictions, past = model(batch, attention_mask=mask, labels=features[indices])
+    if multigpu:
+        loss = loss.mean()
     loss.backward()
     optim.step()
     
     if i % hparams['epoch_length'] == 0:
-        tqdm.write('Epoch %d, loss %f - %s' % (i // hparams['epoch_length'], loss.cpu(), synthesize("a3b")))
-        torch.save(model.state_dict(), '%s/model.pth' % hparams['checkpoint_dir'])
+        tqdm.write('Epoch %d, loss %f' % (i // hparams['epoch_length'], loss.cpu()))
 
-torch.save(model.state_dict(), '%s/final.pth' % hparams['checkpoint_dir'])
+        try:
+            state_dict = model.module.state_dict()
+        except AttributeError:
+            state_dict = model.state_dict()
+        torch.save(state_dict, '%s/model%d.pth' % (hparams['checkpoint_dir'], i//hparams['epoch_length']))
+
+
+try:
+    state_dict = model.module.state_dict()
+except AttributeError:
+    state_dict = model.state_dict()
+torch.save(state_dict, '%s/final.pth' % hparams['checkpoint_dir'])
